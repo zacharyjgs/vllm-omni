@@ -199,7 +199,11 @@ async def _aligned_sse_generator(
                     has_cursor_metadata = True
                     chunk_frame_start = fs
                     chunk_frame_end = fe
-                    cursor_end = ce if ce is not None else 0
+                    # Prefer engine-reported cursor; derive from frame range
+                    # when unavailable.  In streaming mode (non_streaming_mode=
+                    # False), frame K consumes text token K+1 (token 0 was in
+                    # prefill), so cursor = frame_end + 1.
+                    cursor_end = ce if ce and ce > 0 else fe + 1
                 else:
                     chunk_frames = max(1, round(chunk_samples / samples_per_frame))
                     chunk_frame_start = cumulative_frames
@@ -209,33 +213,29 @@ async def _aligned_sse_generator(
                 while word_cursor < len(word_boundaries):
                     wb = word_boundaries[word_cursor]
                     ft = wb["first_token"]
+                    lt = wb["last_token"]
 
-                    if has_cursor_metadata and cursor_end > 0:
-                        # cursor_end = total text tokens consumed after this chunk.
-                        # A word starting at token ft is spoken once cursor > ft.
+                    # In streaming mode, frame K consumes text token K+1
+                    # (token 0 consumed during prefill).  Word is spoken
+                    # once cursor_end > ft.
+                    if cursor_end > 0:
                         if cursor_end <= ft:
                             break
                     else:
-                        # Fallback: frame K corresponds to text token K+1
-                        # (token 0 consumed in prefill, before decode frame 0).
-                        speak_frame = max(0, ft - 1)
-                        if speak_frame >= chunk_frame_end:
+                        if max(0, ft - 1) >= chunk_frame_end:
                             break
 
-                    if has_cursor_metadata and cursor_end > 0:
-                        offset_frames = max(0, ft - 1)
-                    else:
-                        offset_frames = chunk_frame_start + max(0, ft - chunk_frame_start)
-
+                    # offset: frame where this word's first token is consumed
+                    offset_frames = max(0, ft - 1)
                     offset_ms = round(offset_frames * samples_per_frame / sample_rate * 1000.0)
 
-                    next_ft = (
-                        word_boundaries[word_cursor + 1]["first_token"]
-                        if word_cursor + 1 < len(word_boundaries)
-                        else chunk_frame_end
-                    )
-                    dur_samples = (next_ft - ft) * samples_per_frame
-                    dur_ms = round(dur_samples / sample_rate * 1000.0)
+                    # duration: spans from first_token to next word's first_token
+                    if word_cursor + 1 < len(word_boundaries):
+                        next_ft = word_boundaries[word_cursor + 1]["first_token"]
+                    else:
+                        next_ft = lt + 1
+                    dur_frames = max(1, next_ft - ft)
+                    dur_ms = round(dur_frames * samples_per_frame / sample_rate * 1000.0)
 
                     yield _sse("word", {
                         "text": wb["text"],
@@ -260,16 +260,22 @@ async def _aligned_sse_generator(
         yield _sse("error", {"message": f"Generation failed: {e}"})
         return
 
-    # Flush remaining word events.
     total_ms = round(cumulative_samples / sample_rate * 1000.0)
+
+    # Flush any remaining word events.
     while word_cursor < len(word_boundaries):
         wb = word_boundaries[word_cursor]
         ft = wb["first_token"]
         offset_ms = round(max(0, ft - 1) * samples_per_frame / sample_rate * 1000.0)
+        if word_cursor + 1 < len(word_boundaries):
+            next_ft = word_boundaries[word_cursor + 1]["first_token"]
+            dur_ms = round(max(1, next_ft - ft) * samples_per_frame / sample_rate * 1000.0)
+        else:
+            dur_ms = max(total_ms - offset_ms, 0)
         yield _sse("word", {
             "text": wb["text"],
             "offset_ms": min(offset_ms, total_ms),
-            "duration_ms": max(total_ms - offset_ms, 0),
+            "duration_ms": dur_ms,
             "type": wb["type"],
         })
         word_cursor += 1
