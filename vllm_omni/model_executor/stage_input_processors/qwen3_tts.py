@@ -148,17 +148,6 @@ def talker2code2wav_async_chunk(
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
-            # Track text_token_cursor per codec frame for word alignment.
-            ttc = pooling_output.get("text_token_cursor")
-            if isinstance(ttc, torch.Tensor) and ttc.numel() > 0:
-                ttc_val = int(ttc[-1].item())
-            elif isinstance(ttc, (int, float)):
-                ttc_val = int(ttc)
-            else:
-                ttc_val = -1
-            if not hasattr(transfer_manager, "_text_token_cursors"):
-                transfer_manager._text_token_cursors = {}
-            transfer_manager._text_token_cursors.setdefault(request_id, []).append(ttc_val)
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -264,20 +253,18 @@ def talker2code2wav_async_chunk(
     num_frames = len(window_frames)
     code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
-    # Slice text_token_cursors for the new frames in this chunk (excluding
-    # left context and ref_code prefix, which are repeated context).
-    ttc_store = getattr(transfer_manager, "_text_token_cursors", {})
-    ttc_all = ttc_store.get(request_id, [])
-    new_frame_count = context_length
-    ttc_for_chunk = ttc_all[-new_frame_count:] if len(ttc_all) >= new_frame_count else ttc_all[:]
+    # Emit frame range for this chunk so the aligned endpoint can map
+    # codec frames to text tokens (1 frame = 1 decode step = 1 text token).
+    chunk_frame_start = length - context_length
+    chunk_frame_end = length
 
     info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
         "finished": finished,
+        "chunk_frame_start": chunk_frame_start,
+        "chunk_frame_end": chunk_frame_end,
     }
-    if ttc_for_chunk:
-        info["text_token_cursors"] = ttc_for_chunk
     speaker = extract_speaker_from_request(request)
     if speaker is not None:
         info["speaker"] = speaker

@@ -472,7 +472,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         ref_code_len_list: list[torch.Tensor] = []
         ref_code_tensor: torch.Tensor | None = None
         codec_streaming_list: list[torch.Tensor] = []
-        text_cursor_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
@@ -483,11 +482,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 if isinstance(cs, bool):
                     codec_streaming_list.append(
                         torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
-                    )
-                tc = info.get("text_token_cursor")
-                if isinstance(tc, int):
-                    text_cursor_list.append(
-                        torch.full((int(ac.shape[0]),), tc, dtype=torch.int32, device=ac.device)
                     )
             ref_code = info.get("ref_code")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
@@ -524,8 +518,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             mm["ref_code"] = [ref_code_tensor]
         if codec_streaming_list:
             mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
-        if text_cursor_list:
-            mm["text_token_cursor"] = torch.cat(text_cursor_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -581,18 +573,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # Store full prompt embeddings on CPU (large, prefill-only).
                 # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
-                # Track text token consumption for word-level alignment.
-                # First text token is consumed during prefill; tailing_text_hidden
-                # holds the remaining tokens + EOS.
-                total_text_tokens = int(tailing_text_hidden.shape[-2]) + 1
                 info_update: dict[str, Any] = {
                     "talker_prompt_embeds": prompt_embeds_cpu,
                     "tailing_text_hidden": tailing_text_hidden.detach(),
                     "tts_pad_embed": tts_pad_embed.detach(),
                     "talker_prefill_offset": 0,
                     "codec_streaming": codec_streaming,
-                    "text_token_cursor": 1,
-                    "total_text_tokens": total_text_tokens,
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
@@ -649,17 +635,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         tail = info_dict.get("tailing_text_hidden")
-        cursor = info_dict.get("text_token_cursor", -1)
-        total_tt = info_dict.get("total_text_tokens", -1)
         if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
             text_step = tail[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
             new_tail = tail[1:] if tail.shape[0] > 1 else tail[:0]
-            cursor = cursor + 1 if isinstance(cursor, int) and cursor >= 0 else -1
         else:
             text_step = tts_pad_embed
             new_tail = tail if isinstance(tail, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
-            if isinstance(cursor, int) and cursor >= 0 and isinstance(total_tt, int):
-                cursor = total_tt
 
         last_hidden = info_dict.get("last_talker_hidden")
         if not isinstance(last_hidden, torch.Tensor):
@@ -676,7 +657,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             "tailing_text_hidden": new_tail,
             "mtp_inputs": (past_hidden, text_step),
             "codec_streaming": codec_streaming,
-            "text_token_cursor": cursor,
         }
         return input_ids, inputs_embeds_out, info_update
 

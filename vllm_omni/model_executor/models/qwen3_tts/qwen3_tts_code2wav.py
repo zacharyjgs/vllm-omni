@@ -301,19 +301,11 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
-        # Pass through text_token_cursors per-chunk for word alignment.
-        ttc_per_req: list[list[int] | None] = [None] * num_req
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
-                if i >= num_req:
-                    break
-                ttc = info.get("text_token_cursors")
-                if isinstance(ttc, list):
-                    ttc_per_req[i] = ttc
 
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
+            # Slice on exact codec-frame boundaries instead of proportionally.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
             if start >= wav.shape[0]:
@@ -328,8 +320,20 @@ class Qwen3TTSCode2Wav(nn.Module):
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
         mm: dict[str, Any] = {"model_outputs": audios, "sr": srs}
-        if any(t is not None for t in ttc_per_req):
-            mm["text_token_cursors"] = ttc_per_req
+        if runtime_additional_information is not None:
+            frame_starts = []
+            frame_ends = []
+            for i, info in enumerate(runtime_additional_information):
+                if i >= num_req:
+                    break
+                fs = info.get("chunk_frame_start")
+                fe = info.get("chunk_frame_end")
+                if fs is not None and fe is not None:
+                    frame_starts.append(fs)
+                    frame_ends.append(fe)
+            if frame_starts:
+                mm["chunk_frame_starts"] = frame_starts
+                mm["chunk_frame_ends"] = frame_ends
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs=mm,
