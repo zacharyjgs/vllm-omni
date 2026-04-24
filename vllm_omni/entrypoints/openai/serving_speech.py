@@ -1808,6 +1808,66 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
             yield chunk
 
+    async def _generate_pcm_chunks_with_cursors(self, generator, request_id: str):
+        """Yield (pcm_bytes, text_token_cursors) tuples for aligned streaming.
+
+        ``text_token_cursors`` is a list[int] per audio chunk indicating which
+        text token was being consumed at each codec frame, or ``None`` when the
+        engine does not supply cursor metadata.
+        """
+        prev_count = 0
+        sample_rate_val = 24000
+        prev_ttc_count = 0
+
+        async for res in generator:
+            audio_output, audio_key = self._extract_audio_output(res)
+            if audio_key is None:
+                continue
+
+            sr_raw = audio_output.get("sr")
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+            audio_val = audio_output[audio_key]
+            ttc_raw = audio_output.get("text_token_cursors")
+
+            if isinstance(audio_val, list):
+                new_chunks = audio_val[prev_count:]
+                prev_count = len(audio_val)
+            else:
+                new_chunks = [audio_val] if audio_val is not None else []
+                prev_count += len(new_chunks)
+
+            # Extract cursor lists for new chunks.
+            new_ttc: list[list[int] | None] = [None] * len(new_chunks)
+            if isinstance(ttc_raw, list):
+                ttc_tail = ttc_raw[prev_ttc_count:]
+                prev_ttc_count = len(ttc_raw)
+                for k, t in enumerate(ttc_tail):
+                    if k < len(new_ttc):
+                        new_ttc[k] = t
+
+            for i, chunk_tensor in enumerate(new_chunks):
+                chunk_np = (
+                    chunk_tensor.float().detach().cpu().numpy()
+                    if hasattr(chunk_tensor, "float")
+                    else chunk_tensor
+                )
+                if chunk_np.ndim > 1:
+                    chunk_np = chunk_np.squeeze()
+                from vllm_omni.entrypoints.openai.serving_speech import CreateAudio
+                audio_obj = CreateAudio(
+                    audio_tensor=chunk_np,
+                    sample_rate=sample_rate_val,
+                    response_format="pcm",
+                    speed=1.0,
+                    stream_format="audio",
+                    base64_encode=False,
+                )
+                pcm_bytes = self.create_audio(audio_obj).audio_data
+                yield pcm_bytes, new_ttc[i]
+
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
