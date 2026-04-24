@@ -2,9 +2,15 @@
 timing events derived from codec frame positions during generation.
 
 The Qwen3-TTS Talker consumes exactly one text conditioning vector per decode
-step, producing one codec frame per step.  The stage processor tracks the frame
-range for each audio chunk.  Combined with the tokenizer's offset mapping, this
-gives us precise word-level timing: frame N = text token N.
+step, producing one codec frame per step.  In streaming mode
+(non_streaming_mode=False), the first text token is consumed in prefill and
+subsequent tokens are consumed one-per-step.  The Talker tracks a
+``text_token_cursor`` (total tokens consumed so far) which propagates through
+the stage processor and Code2Wav as ``chunk_cursor_start`` /
+``chunk_cursor_end`` scalar tensors.
+
+The aligned endpoint forces streaming mode and maps cursor values to tokenizer
+offset-mapping word boundaries for precise word-level timing.
 
 SSE protocol (mirrors tts-generation-backend Azure pattern):
     event: word    -- word/punc boundary with offset_ms, duration_ms
@@ -21,6 +27,7 @@ import json
 import unicodedata
 from typing import Any
 
+import numpy as np
 from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -46,8 +53,7 @@ def _build_word_boundaries(
 
     Returns ``[{text, first_token, last_token, type}, ...]``.
     Token indices are 0-based corresponding to the tokenizer output without
-    special tokens.  Frame N in the Talker corresponds to text token N
-    (the first frame consumes the first text token, etc.).
+    special tokens.
     """
     encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = encoding["input_ids"]
@@ -111,6 +117,15 @@ def _sse(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _extract_scalar(audio_output: dict, key: str, index: int) -> int | None:
+    """Extract an int scalar from a cumulative list of tensors at *index*."""
+    val = audio_output.get(key)
+    if not isinstance(val, list) or index >= len(val):
+        return None
+    v = val[index]
+    return int(v.item()) if hasattr(v, "item") else int(v)
+
+
 async def _aligned_sse_generator(
     speech_service: OmniOpenAIServingSpeech,
     request: OpenAICreateSpeechRequest,
@@ -120,11 +135,12 @@ async def _aligned_sse_generator(
 ) -> Any:
     """Async generator yielding SSE strings with interleaved word + audio events.
 
-    Uses codec frame metadata from the engine to determine word boundaries.
-    Falls back to precomputed token-rate alignment when metadata is unavailable.
+    Iterates over the raw engine generator to extract both audio tensors and
+    cursor metadata from Code2Wav's multimodal_outputs.
     """
     request.stream = True
     request.response_format = "pcm"
+    request.non_streaming_mode = False
 
     try:
         request_id, generator, _ = await speech_service._prepare_speech_generation(request)
@@ -135,34 +151,84 @@ async def _aligned_sse_generator(
     word_cursor = 0
     cumulative_samples = 0
     cumulative_frames = 0
+    prev_audio_count = 0
     samples_per_frame = sample_rate / codec_fps if codec_fps > 0 else sample_rate / 12.5
-    has_frame_metadata = False
+    has_cursor_metadata = False
 
     try:
-        async for res in speech_service._generate_audio_chunks(
-            generator, request_id, response_format="pcm"
-        ):
-            pcm_bytes = res
-            chunk_samples = len(pcm_bytes) // _PCM_BYTES_PER_SAMPLE
+        async for res in generator:
+            audio_output, audio_key = speech_service._extract_audio_output(res)
+            if audio_key is None:
+                continue
 
-            # Try to extract frame metadata from the engine result.
-            # (The output processor accumulates these from Code2Wav.)
-            # For now, estimate frames from audio duration and codec rate.
-            chunk_frames = max(1, round(chunk_samples / samples_per_frame))
-            chunk_frame_start = cumulative_frames
-            chunk_frame_end = cumulative_frames + chunk_frames
+            sr_raw = audio_output.get("sr")
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                samples_per_frame = sample_rate / codec_fps
 
-            # Emit word events for words whose first_token falls within
-            # this chunk's frame range.
-            while word_cursor < len(word_boundaries):
-                wb = word_boundaries[word_cursor]
-                ft = wb["first_token"]
-                if ft < chunk_frame_end:
-                    offset_ms = round(
-                        (chunk_frame_start + max(0, ft - chunk_frame_start))
-                        * samples_per_frame / sample_rate * 1000.0
-                    )
-                    # Duration estimate: to next word or end of chunk.
+            audio_val = audio_output[audio_key]
+            if isinstance(audio_val, list):
+                new_chunks = audio_val[prev_audio_count:]
+                new_start_idx = prev_audio_count
+                prev_audio_count = len(audio_val)
+            else:
+                new_chunks = [audio_val] if audio_val is not None else []
+                new_start_idx = max(0, prev_audio_count - 1)
+                prev_audio_count += len(new_chunks)
+
+            for ci, chunk_tensor in enumerate(new_chunks):
+                if chunk_tensor is None:
+                    continue
+                if hasattr(chunk_tensor, "numel") and chunk_tensor.numel() == 0:
+                    continue
+
+                chunk_idx = new_start_idx + ci
+
+                fs = _extract_scalar(audio_output, "chunk_frame_start", chunk_idx)
+                fe = _extract_scalar(audio_output, "chunk_frame_end", chunk_idx)
+                cs = _extract_scalar(audio_output, "chunk_cursor_start", chunk_idx)
+                ce = _extract_scalar(audio_output, "chunk_cursor_end", chunk_idx)
+
+                wav_np = chunk_tensor.detach().cpu().float().numpy()
+                pcm_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
+                pcm_bytes = pcm_int16.tobytes()
+                chunk_samples = len(pcm_bytes) // _PCM_BYTES_PER_SAMPLE
+
+                if fs is not None and fe is not None and fe > 0:
+                    has_cursor_metadata = True
+                    chunk_frame_start = fs
+                    chunk_frame_end = fe
+                    cursor_end = ce if ce is not None else 0
+                else:
+                    chunk_frames = max(1, round(chunk_samples / samples_per_frame))
+                    chunk_frame_start = cumulative_frames
+                    chunk_frame_end = cumulative_frames + chunk_frames
+                    cursor_end = 0
+
+                while word_cursor < len(word_boundaries):
+                    wb = word_boundaries[word_cursor]
+                    ft = wb["first_token"]
+
+                    if has_cursor_metadata and cursor_end > 0:
+                        # cursor_end = total text tokens consumed after this chunk.
+                        # A word starting at token ft is spoken once cursor > ft.
+                        if cursor_end <= ft:
+                            break
+                    else:
+                        # Fallback: frame K corresponds to text token K+1
+                        # (token 0 consumed in prefill, before decode frame 0).
+                        speak_frame = max(0, ft - 1)
+                        if speak_frame >= chunk_frame_end:
+                            break
+
+                    if has_cursor_metadata and cursor_end > 0:
+                        offset_frames = max(0, ft - 1)
+                    else:
+                        offset_frames = chunk_frame_start + max(0, ft - chunk_frame_start)
+
+                    offset_ms = round(offset_frames * samples_per_frame / sample_rate * 1000.0)
+
                     next_ft = (
                         word_boundaries[word_cursor + 1]["first_token"]
                         if word_cursor + 1 < len(word_boundaries)
@@ -170,6 +236,7 @@ async def _aligned_sse_generator(
                     )
                     dur_samples = (next_ft - ft) * samples_per_frame
                     dur_ms = round(dur_samples / sample_rate * 1000.0)
+
                     yield _sse("word", {
                         "text": wb["text"],
                         "offset_ms": offset_ms,
@@ -177,14 +244,12 @@ async def _aligned_sse_generator(
                         "type": wb["type"],
                     })
                     word_cursor += 1
-                else:
-                    break
 
-            cumulative_frames = chunk_frame_end
+                cumulative_frames = chunk_frame_end
 
-            b64 = base64.b64encode(pcm_bytes).decode("ascii")
-            yield _sse("audio", {"chunk": b64})
-            cumulative_samples += chunk_samples
+                b64 = base64.b64encode(pcm_bytes).decode("ascii")
+                yield _sse("audio", {"chunk": b64})
+                cumulative_samples += chunk_samples
 
     except asyncio.CancelledError:
         logger.info("Aligned speech stream cancelled by client")
@@ -200,7 +265,7 @@ async def _aligned_sse_generator(
     while word_cursor < len(word_boundaries):
         wb = word_boundaries[word_cursor]
         ft = wb["first_token"]
-        offset_ms = round(ft * samples_per_frame / sample_rate * 1000.0)
+        offset_ms = round(max(0, ft - 1) * samples_per_frame / sample_rate * 1000.0)
         yield _sse("word", {
             "text": wb["text"],
             "offset_ms": min(offset_ms, total_ms),
@@ -209,7 +274,10 @@ async def _aligned_sse_generator(
         })
         word_cursor += 1
 
-    yield _sse("done", {"total_duration_ms": total_ms})
+    yield _sse("done", {
+        "total_duration_ms": total_ms,
+        "cursor_metadata_available": has_cursor_metadata,
+    })
 
 
 def _ensure_tokenizer(speech_service: OmniOpenAIServingSpeech) -> AutoTokenizer:

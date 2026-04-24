@@ -148,6 +148,13 @@ def talker2code2wav_async_chunk(
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            ttc = pooling_output.get("text_token_cursor")
+            if isinstance(ttc, torch.Tensor) and ttc.numel() > 0:
+                if not hasattr(transfer_manager, "_text_cursors"):
+                    transfer_manager._text_cursors = {}
+                if request_id not in transfer_manager._text_cursors:
+                    transfer_manager._text_cursors[request_id] = []
+                transfer_manager._text_cursors[request_id].append(int(ttc.reshape(-1)[-1].item()))
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -258,12 +265,22 @@ def talker2code2wav_async_chunk(
     chunk_frame_start = length - context_length
     chunk_frame_end = length
 
+    cursors = getattr(transfer_manager, "_text_cursors", {}).get(request_id, [])
+    chunk_cursor_start = cursors[chunk_frame_start] if chunk_frame_start < len(cursors) else 0
+    chunk_cursor_end = (
+        cursors[chunk_frame_end - 1]
+        if chunk_frame_end > 0 and chunk_frame_end - 1 < len(cursors)
+        else (cursors[-1] if cursors else 0)
+    )
+
     info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
         "finished": finished,
         "chunk_frame_start": chunk_frame_start,
         "chunk_frame_end": chunk_frame_end,
+        "chunk_cursor_start": chunk_cursor_start,
+        "chunk_cursor_end": chunk_cursor_end,
     }
     speaker = extract_speaker_from_request(request)
     if speaker is not None:

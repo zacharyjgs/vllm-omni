@@ -472,12 +472,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         ref_code_len_list: list[torch.Tensor] = []
         ref_code_tensor: torch.Tensor | None = None
         codec_streaming_list: list[torch.Tensor] = []
+        text_cursor_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
             ac = info.get("audio_codes")
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
+                tc = info.get("text_token_cursor")
+                if tc is not None:
+                    text_cursor_list.append(
+                        torch.full((int(ac.shape[0]), 1), int(tc), dtype=torch.int32, device=ac.device)
+                    )
                 cs = info.get("codec_streaming")
                 if isinstance(cs, bool):
                     codec_streaming_list.append(
@@ -518,6 +524,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             mm["ref_code"] = [ref_code_tensor]
         if codec_streaming_list:
             mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+        if text_cursor_list:
+            mm["text_token_cursor"] = torch.cat(text_cursor_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -579,6 +587,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     "tts_pad_embed": tts_pad_embed.detach(),
                     "talker_prefill_offset": 0,
                     "codec_streaming": codec_streaming,
+                    "text_token_cursor": 1,
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
@@ -653,10 +662,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         )
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
+        current_cursor = int(info_dict.get("text_token_cursor", 0))
+        consumed_text = isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0
         info_update = {
             "tailing_text_hidden": new_tail,
             "mtp_inputs": (past_hidden, text_step),
             "codec_streaming": codec_streaming,
+            "text_token_cursor": current_cursor + (1 if consumed_text else 0),
         }
         return input_ids, inputs_embeds_out, info_update
 

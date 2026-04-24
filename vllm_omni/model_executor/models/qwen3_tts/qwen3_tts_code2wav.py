@@ -302,6 +302,27 @@ class Qwen3TTSCode2Wav(nn.Module):
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
+        chunk_frame_starts = [torch.tensor(0, dtype=torch.int32)] * num_req
+        chunk_frame_ends = [torch.tensor(0, dtype=torch.int32)] * num_req
+        chunk_cursor_starts = [torch.tensor(0, dtype=torch.int32)] * num_req
+        chunk_cursor_ends = [torch.tensor(0, dtype=torch.int32)] * num_req
+        if runtime_additional_information is not None:
+            for i, info in enumerate(runtime_additional_information):
+                if i >= num_req:
+                    break
+                chunk_frame_starts[i] = torch.tensor(
+                    int(info.get("chunk_frame_start", 0)), dtype=torch.int32
+                )
+                chunk_frame_ends[i] = torch.tensor(
+                    int(info.get("chunk_frame_end", 0)), dtype=torch.int32
+                )
+                chunk_cursor_starts[i] = torch.tensor(
+                    int(info.get("chunk_cursor_start", 0)), dtype=torch.int32
+                )
+                chunk_cursor_ends[i] = torch.tensor(
+                    int(info.get("chunk_cursor_end", 0)), dtype=torch.int32
+                )
+
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
@@ -321,7 +342,14 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                "sr": srs,
+                "chunk_frame_start": chunk_frame_starts,
+                "chunk_frame_end": chunk_frame_ends,
+                "chunk_cursor_start": chunk_cursor_starts,
+                "chunk_cursor_end": chunk_cursor_ends,
+            },
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:

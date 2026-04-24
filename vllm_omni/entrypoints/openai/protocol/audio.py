@@ -74,6 +74,11 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description="Override the Talker's text-conditioning mode. False enables streaming "
+        "(one text token per decode step), required for cursor-based word timing.",
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
