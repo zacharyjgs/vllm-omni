@@ -1,21 +1,25 @@
 """Streaming SSE endpoint that returns TTS audio interleaved with word-level
-timing events derived from codec frame positions during generation.
+timing events.
 
-The Qwen3-TTS Talker consumes exactly one text conditioning vector per decode
-step, producing one codec frame per step.  In streaming mode
-(non_streaming_mode=False), the first text token is consumed in prefill and
-subsequent tokens are consumed one-per-step.  The Talker tracks a
-``text_token_cursor`` (total tokens consumed so far) which propagates through
-the stage processor and Code2Wav as ``chunk_cursor_start`` /
-``chunk_cursor_end`` scalar tensors.
+The Qwen3-TTS Talker front-loads text-token consumption (one token per decode
+step while text vectors remain, then pad embeddings).  Token consumption rate
+does NOT correspond to audible speech rate -- the model generates the full
+utterance across all frames after consuming the text.
 
-The aligned endpoint forces streaming mode and maps cursor values to tokenizer
-offset-mapping word boundaries for precise word-level timing.
+To produce accurate word-level timing we therefore:
 
-SSE protocol (mirrors tts-generation-backend Azure pattern):
-    event: word    -- word/punc boundary with offset_ms, duration_ms
-    event: audio   -- base64-encoded PCM chunk
-    event: done    -- stream complete
+1.  Stream audio chunks to the client immediately as they arrive.
+2.  Accumulate the full PCM waveform.
+3.  After generation completes, analyse audio energy to detect the speech
+    onset / offset (stripping leading/trailing silence).
+4.  Distribute words within the detected speech region using character-
+    weighted proportional timing (longer words → more time).
+
+SSE protocol:
+    event: audio   -- base64-encoded PCM chunk (streamed in real time)
+    event: word    -- word boundary with offset_ms / duration_ms (emitted
+                      after all audio, before ``done``)
+    event: done    -- stream complete with total_duration_ms
     event: error   -- generation failure
 """
 
@@ -24,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import unicodedata
 from typing import Any
 
@@ -40,6 +45,11 @@ logger = init_logger(__name__)
 _PCM_BYTES_PER_SAMPLE = 2
 _DEFAULT_CODEC_FPS = 12.5
 
+# Energy-based speech detection parameters
+_ENERGY_FRAME_MS = 20
+_ENERGY_THRESHOLD_RATIO = 0.04  # fraction of peak RMS to treat as speech
+_MIN_SPEECH_FRAMES = 3  # require N consecutive frames above threshold
+
 
 def _is_punctuation(text: str) -> bool:
     return all(unicodedata.category(ch).startswith("P") for ch in text if ch.strip())
@@ -52,8 +62,6 @@ def _build_word_boundaries(
     """Map text to words with token-index boundaries.
 
     Returns ``[{text, first_token, last_token, type}, ...]``.
-    Token indices are 0-based corresponding to the tokenizer output without
-    special tokens.
     """
     encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = encoding["input_ids"]
@@ -117,14 +125,123 @@ def _sse(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-def _extract_scalar(audio_output: dict, key: str, index: int) -> int | None:
-    """Extract an int scalar from a cumulative list of tensors at *index*."""
-    val = audio_output.get(key)
-    if not isinstance(val, list) or index >= len(val):
-        return None
-    v = val[index]
-    return int(v.item()) if hasattr(v, "item") else int(v)
+# ---------------------------------------------------------------------------
+#  Audio energy analysis
+# ---------------------------------------------------------------------------
 
+def _compute_rms_frames(pcm: np.ndarray, sample_rate: int, frame_ms: int = _ENERGY_FRAME_MS) -> np.ndarray:
+    """Return per-frame RMS energy for *pcm* (float32, mono)."""
+    frame_size = int(sample_rate * frame_ms / 1000)
+    if frame_size <= 0 or len(pcm) < frame_size:
+        return np.array([], dtype=np.float32)
+    n_frames = len(pcm) // frame_size
+    trimmed = pcm[: n_frames * frame_size].reshape(n_frames, frame_size)
+    return np.sqrt(np.mean(trimmed ** 2, axis=1))
+
+
+def _detect_speech_bounds_ms(
+    pcm: np.ndarray,
+    sample_rate: int,
+    frame_ms: int = _ENERGY_FRAME_MS,
+) -> tuple[float, float]:
+    """Return (speech_start_ms, speech_end_ms) from energy thresholding.
+
+    Uses a conservative threshold to find the first and last regions of
+    sustained energy, which approximates where audible speech begins and
+    ends.
+    """
+    rms = _compute_rms_frames(pcm, sample_rate, frame_ms)
+    if rms.size == 0:
+        total_ms = len(pcm) / sample_rate * 1000.0
+        return 0.0, total_ms
+
+    peak = float(rms.max())
+    if peak < 1e-8:
+        total_ms = len(pcm) / sample_rate * 1000.0
+        return 0.0, total_ms
+
+    threshold = peak * _ENERGY_THRESHOLD_RATIO
+    above = rms > threshold
+
+    # Find first run of _MIN_SPEECH_FRAMES consecutive active frames.
+    start_idx = 0
+    count = 0
+    for i, v in enumerate(above):
+        if v:
+            count += 1
+            if count >= _MIN_SPEECH_FRAMES:
+                start_idx = i - _MIN_SPEECH_FRAMES + 1
+                break
+        else:
+            count = 0
+
+    # Find last run of _MIN_SPEECH_FRAMES consecutive active frames.
+    end_idx = len(rms) - 1
+    count = 0
+    for i in range(len(above) - 1, -1, -1):
+        if above[i]:
+            count += 1
+            if count >= _MIN_SPEECH_FRAMES:
+                end_idx = i + _MIN_SPEECH_FRAMES - 1
+                break
+        else:
+            count = 0
+
+    start_ms = float(start_idx * frame_ms)
+    end_ms = float((end_idx + 1) * frame_ms)
+    return start_ms, end_ms
+
+
+# ---------------------------------------------------------------------------
+#  Word timing computation
+# ---------------------------------------------------------------------------
+
+_PUNCT_STRIP = set(".,!?;:'\"-()[]{}…")
+
+
+def _word_weight(text: str) -> float:
+    """Estimate relative speaking duration from word text.
+
+    Uses cleaned character count as a simple but non-uniform proxy for
+    phonetic duration.  Punctuation-only tokens get a small fixed weight
+    representing a natural pause.
+    """
+    cleaned = "".join(ch for ch in text if ch not in _PUNCT_STRIP)
+    if not cleaned:
+        return 0.5  # pause weight for standalone punctuation
+    return float(max(1, len(cleaned)))
+
+
+def _compute_word_timings(
+    word_boundaries: list[dict[str, Any]],
+    speech_start_ms: float,
+    speech_end_ms: float,
+) -> list[dict[str, Any]]:
+    """Distribute words across the detected speech region by character weight."""
+    speech_dur = max(0.0, speech_end_ms - speech_start_ms)
+    if not word_boundaries or speech_dur <= 0:
+        return []
+
+    weights = [_word_weight(wb["text"]) for wb in word_boundaries]
+    total_weight = sum(weights) or 1.0
+
+    events: list[dict[str, Any]] = []
+    cursor_ms = speech_start_ms
+    for i, wb in enumerate(word_boundaries):
+        dur_ms = speech_dur * (weights[i] / total_weight)
+        events.append({
+            "text": wb["text"],
+            "offset_ms": round(cursor_ms),
+            "duration_ms": round(dur_ms),
+            "type": wb["type"],
+        })
+        cursor_ms += dur_ms
+    return events
+
+
+# ---------------------------------------------------------------------------
+#  SSE generator
+# ---------------------------------------------------------------------------
 
 async def _aligned_sse_generator(
     speech_service: OmniOpenAIServingSpeech,
@@ -133,11 +250,8 @@ async def _aligned_sse_generator(
     codec_fps: float,
     sample_rate: int = 24000,
 ) -> Any:
-    """Async generator yielding SSE strings with interleaved word + audio events.
-
-    Iterates over the raw engine generator to extract both audio tensors and
-    cursor metadata from Code2Wav's multimodal_outputs.
-    """
+    """Yield SSE strings: audio chunks streamed in real time, word events
+    emitted after full audio analysis for accurate alignment."""
     request.stream = True
     request.response_format = "pcm"
     request.non_streaming_mode = False
@@ -148,12 +262,8 @@ async def _aligned_sse_generator(
         yield _sse("error", {"message": f"Failed to prepare generation: {e}"})
         return
 
-    word_cursor = 0
-    cumulative_samples = 0
-    cumulative_frames = 0
     prev_audio_count = 0
-    samples_per_frame = sample_rate / codec_fps if codec_fps > 0 else sample_rate / 12.5
-    has_cursor_metadata = False
+    all_pcm_chunks: list[np.ndarray] = []
 
     try:
         async for res in generator:
@@ -165,92 +275,29 @@ async def _aligned_sse_generator(
             if sr_raw is not None:
                 sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
                 sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-                samples_per_frame = sample_rate / codec_fps
 
             audio_val = audio_output[audio_key]
             if isinstance(audio_val, list):
                 new_chunks = audio_val[prev_audio_count:]
-                new_start_idx = prev_audio_count
                 prev_audio_count = len(audio_val)
             else:
                 new_chunks = [audio_val] if audio_val is not None else []
-                new_start_idx = max(0, prev_audio_count - 1)
                 prev_audio_count += len(new_chunks)
 
-            for ci, chunk_tensor in enumerate(new_chunks):
+            for chunk_tensor in new_chunks:
                 if chunk_tensor is None:
                     continue
                 if hasattr(chunk_tensor, "numel") and chunk_tensor.numel() == 0:
                     continue
 
-                chunk_idx = new_start_idx + ci
-
-                fs = _extract_scalar(audio_output, "chunk_frame_start", chunk_idx)
-                fe = _extract_scalar(audio_output, "chunk_frame_end", chunk_idx)
-                cs = _extract_scalar(audio_output, "chunk_cursor_start", chunk_idx)
-                ce = _extract_scalar(audio_output, "chunk_cursor_end", chunk_idx)
-
                 wav_np = chunk_tensor.detach().cpu().float().numpy()
                 pcm_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
                 pcm_bytes = pcm_int16.tobytes()
-                chunk_samples = len(pcm_bytes) // _PCM_BYTES_PER_SAMPLE
 
-                if fs is not None and fe is not None and fe > 0:
-                    has_cursor_metadata = True
-                    chunk_frame_start = fs
-                    chunk_frame_end = fe
-                    # Prefer engine-reported cursor; derive from frame range
-                    # when unavailable.  In streaming mode (non_streaming_mode=
-                    # False), frame K consumes text token K+1 (token 0 was in
-                    # prefill), so cursor = frame_end + 1.
-                    cursor_end = ce if ce and ce > 0 else fe + 1
-                else:
-                    chunk_frames = max(1, round(chunk_samples / samples_per_frame))
-                    chunk_frame_start = cumulative_frames
-                    chunk_frame_end = cumulative_frames + chunk_frames
-                    cursor_end = 0
-
-                while word_cursor < len(word_boundaries):
-                    wb = word_boundaries[word_cursor]
-                    ft = wb["first_token"]
-                    lt = wb["last_token"]
-
-                    # In streaming mode, frame K consumes text token K+1
-                    # (token 0 consumed during prefill).  Word is spoken
-                    # once cursor_end > ft.
-                    if cursor_end > 0:
-                        if cursor_end <= ft:
-                            break
-                    else:
-                        if ft >= chunk_frame_end:
-                            break
-
-                    # offset: use token index directly so every word gets
-                    # a distinct timestamp (1 frame = 80ms at 12.5 fps).
-                    offset_frames = ft
-                    offset_ms = round(offset_frames * samples_per_frame / sample_rate * 1000.0)
-
-                    # duration: spans from first_token to next word's first_token
-                    if word_cursor + 1 < len(word_boundaries):
-                        next_ft = word_boundaries[word_cursor + 1]["first_token"]
-                    else:
-                        next_ft = lt + 1
-                    dur_frames = max(1, next_ft - ft)
-                    dur_ms = round(dur_frames * samples_per_frame / sample_rate * 1000.0)
-
-                    yield _sse("word", {
-                        "text": wb["text"],
-                        "offset_ms": offset_ms,
-                        "duration_ms": max(dur_ms, 0),
-                        "type": wb["type"],
-                    })
-                    word_cursor += 1
-
-                cumulative_frames = chunk_frame_end
+                all_pcm_chunks.append(wav_np)
 
                 b64 = base64.b64encode(pcm_bytes).decode("ascii")
                 yield _sse("audio", {"chunk": b64})
-                cumulative_samples += chunk_samples
 
     except asyncio.CancelledError:
         logger.info("Aligned speech stream cancelled by client")
@@ -261,29 +308,28 @@ async def _aligned_sse_generator(
         yield _sse("error", {"message": f"Generation failed: {e}"})
         return
 
-    total_ms = round(cumulative_samples / sample_rate * 1000.0)
+    # -- Post-generation: analyse audio and compute word timings --
+    if all_pcm_chunks:
+        full_pcm = np.concatenate(all_pcm_chunks)
+    else:
+        full_pcm = np.array([], dtype=np.float32)
 
-    # Flush any remaining word events.
-    while word_cursor < len(word_boundaries):
-        wb = word_boundaries[word_cursor]
-        ft = wb["first_token"]
-        offset_ms = round(ft * samples_per_frame / sample_rate * 1000.0)
-        if word_cursor + 1 < len(word_boundaries):
-            next_ft = word_boundaries[word_cursor + 1]["first_token"]
-            dur_ms = round(max(1, next_ft - ft) * samples_per_frame / sample_rate * 1000.0)
-        else:
-            dur_ms = max(total_ms - offset_ms, 0)
-        yield _sse("word", {
-            "text": wb["text"],
-            "offset_ms": min(offset_ms, total_ms),
-            "duration_ms": dur_ms,
-            "type": wb["type"],
-        })
-        word_cursor += 1
+    total_samples = len(full_pcm)
+    total_ms = round(total_samples / sample_rate * 1000.0) if sample_rate > 0 else 0
+
+    if word_boundaries and total_samples > 0:
+        speech_start, speech_end = _detect_speech_bounds_ms(full_pcm, sample_rate)
+        word_events = _compute_word_timings(word_boundaries, speech_start, speech_end)
+        for evt in word_events:
+            yield _sse("word", evt)
+    else:
+        speech_start = 0.0
+        speech_end = float(total_ms)
 
     yield _sse("done", {
         "total_duration_ms": total_ms,
-        "cursor_metadata_available": has_cursor_metadata,
+        "speech_start_ms": round(speech_start),
+        "speech_end_ms": round(speech_end),
     })
 
 
