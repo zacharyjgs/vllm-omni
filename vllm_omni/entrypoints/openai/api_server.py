@@ -115,6 +115,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech_aligned import create_aligned_speech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -1062,6 +1063,27 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.post("/v1/audio/speech/aligned")
+@with_cancellation
+@load_aware_call
+async def create_aligned_speech_endpoint(
+    request: OpenAICreateSpeechRequest, raw_request: Request
+):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail="The model does not support Speech API",
+        )
+    try:
+        return await create_aligned_speech(handler, request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        ) from e
 
 
 @router.post(
