@@ -222,11 +222,12 @@ async def _aligned_sse_generator(
                         if cursor_end <= ft:
                             break
                     else:
-                        if max(0, ft - 1) >= chunk_frame_end:
+                        if ft >= chunk_frame_end:
                             break
 
-                    # offset: frame where this word's first token is consumed
-                    offset_frames = max(0, ft - 1)
+                    # offset: use token index directly so every word gets
+                    # a distinct timestamp (1 frame = 80ms at 12.5 fps).
+                    offset_frames = ft
                     offset_ms = round(offset_frames * samples_per_frame / sample_rate * 1000.0)
 
                     # duration: spans from first_token to next word's first_token
@@ -266,7 +267,7 @@ async def _aligned_sse_generator(
     while word_cursor < len(word_boundaries):
         wb = word_boundaries[word_cursor]
         ft = wb["first_token"]
-        offset_ms = round(max(0, ft - 1) * samples_per_frame / sample_rate * 1000.0)
+        offset_ms = round(ft * samples_per_frame / sample_rate * 1000.0)
         if word_cursor + 1 < len(word_boundaries):
             next_ft = word_boundaries[word_cursor + 1]["first_token"]
             dur_ms = round(max(1, next_ft - ft) * samples_per_frame / sample_rate * 1000.0)
