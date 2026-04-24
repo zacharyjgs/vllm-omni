@@ -319,22 +319,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
-        mm: dict[str, Any] = {"model_outputs": audios, "sr": srs}
-        if runtime_additional_information is not None:
-            frame_starts: list[torch.Tensor] = []
-            frame_ends: list[torch.Tensor] = []
-            for i in range(num_req):
-                info = runtime_additional_information[i] if i < len(runtime_additional_information) else {}
-                fs = info.get("chunk_frame_start")
-                fe = info.get("chunk_frame_end")
-                frame_starts.append(torch.tensor(fs if fs is not None else 0, dtype=torch.int32))
-                frame_ends.append(torch.tensor(fe if fe is not None else 0, dtype=torch.int32))
-            if any(t.item() != 0 for t in frame_ends):
-                mm["chunk_frame_starts"] = frame_starts
-                mm["chunk_frame_ends"] = frame_ends
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs=mm,
+            multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
